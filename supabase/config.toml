@@ -1,0 +1,13 @@
+project_id ="lzaokxoddjwzpreerfke"
+
+[functions.aps-auth]
+verify_jwt = false
+
+[functions.aps-upload]
+verify_jwt = true
+
+[functions.aps-viewer-token]
+verify_jwt = true
+
+[functions.aps-list-models]
+verify_jwt = true

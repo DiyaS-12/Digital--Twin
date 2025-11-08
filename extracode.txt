@@ -1,0 +1,369 @@
+import { useState, useRef } from 'react';
+import { Upload, FileText, AlertCircle, CheckCircle } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { supabase } from '@/integrations/supabase/client';
+import { toast } from 'sonner';
+import { convertIFCToGLTF } from './convertIFCToGLTF';
+
+interface IFCUploadProps {
+  onUploadComplete?: () => void;
+}
+
+export const IFCUpload = ({ onUploadComplete }: IFCUploadProps) => {
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadSuccess, setUploadSuccess] = useState(false);
+  const [siteName, setSiteName] = useState('');
+  const [location, setLocation] = useState('');
+  const [coordinates, setCoordinates] = useState({ lat: '', lng: '' });
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const ION_TOKEN =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI4MDQ5M2FkMy0zZWY1LTRhMWItODNlYi1lYTA3OTE1NWE4ZDciLCJpZCI6MzUwNjY5LCJpYXQiOjE3NjA1MTM4MTJ9.uWoHR83JvEwAj3VtZ_NHwgfP6sH8p89y_T2WZngHc1g";
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.ifc')) {
+      toast.error('Please select a valid IFC file');
+      return;
+    }
+
+    if (!siteName.trim()) {
+      toast.error('Please enter a site name');
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadSuccess(false);
+
+    try {
+      // ✅ 1️⃣ Check Auth
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        toast.error('Please sign in to upload files');
+        return;
+      }
+
+      // ✅ 2️⃣ Upload to Supabase
+      const timestamp = Date.now();
+      const filename = `${user.id}/${timestamp}_${file.name}`;
+      toast.info('Uploading to Supabase Storage...');
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('ifc-files')
+        .upload(filename, file);
+
+      if (uploadError) {
+        console.error('Upload error:', uploadError);
+        toast.error('Failed to upload file');
+        return;
+      }
+
+      // ✅ 3️⃣ Process with Autodesk APS
+      toast.info('Processing with Autodesk...');
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error('Please sign in again');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('fileName', file.name);
+
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/aps-upload`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`,
+            'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+          },
+          body: formData,
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('APS upload error:', errorData);
+        toast.error('Failed to process with Autodesk');
+        return;
+      }
+
+      const apsData = await response.json();
+      if (!apsData.urn) {
+        console.error('No URN in response:', apsData);
+        toast.error('Failed to process file with Autodesk');
+        return;
+      }
+
+      // ✅ 4️⃣ Convert IFC → GLB
+      toast.info('Converting IFC to GLTF (GLB)...');
+      const glbBlob = await convertIFCToGLTF(file);
+      const glbFileName = file.name.replace(/\.ifc$/i, '.glb');
+      console.log(`🧩 Converted IFC → GLB: ${glbFileName}`);
+      console.log(`📦 Size: ${(glbBlob.size / 1024 / 1024).toFixed(2)} MB`);
+      const tempURL = URL.createObjectURL(glbBlob);
+      console.log('🔗 Preview URL:', tempURL);
+
+      // ✅ 5️⃣ Create Cesium Asset
+      toast.info("Creating Cesium Ion asset...");
+      const assetRes = await fetch("https://api.cesium.com/v1/assets", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ION_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: siteName || "IFC Upload",
+          description: `Uploaded from Supabase - ${user.id}`,
+          type: "3DTILES",
+          options: { sourceType: "3DTILES" },
+        }),
+      });
+
+      const asset = await assetRes.json();
+
+      if (!asset.uploadLocation || !asset.uploadLocation.endpoint) {
+        console.error("Failed to create Cesium asset:", asset);
+        const errorMessage =
+          asset?.message ||
+          asset?.errors?.[0]?.title ||
+          asset?.errors?.detail ||
+          "Failed to create Ion asset. Please verify Ion token and permissions.";
+        toast.error(`Cesium asset creation failed: ${errorMessage}`);
+        return;
+      }
+
+      // 🔍 Debug logging
+      console.log("🔍 Cesium Upload Location:", {
+        endpoint: asset.uploadLocation.endpoint,
+        bucket: asset.uploadLocation.bucket,
+        prefix: asset.uploadLocation.prefix,
+        hasAccessKey: !!asset.uploadLocation.accessKey,
+        hasSecretKey: !!asset.uploadLocation.secretAccessKey,
+        hasSessionToken: !!asset.uploadLocation.sessionToken,
+      });
+
+      // ✅ 6️⃣ Upload GLB to Cesium S3 (VIA EDGE FUNCTION)
+      toast.info("Uploading GLB to Cesium Ion S3...");
+
+      try {
+        // Convert Blob to base64 for transmission to edge function
+        const arrayBuffer = await glbBlob.arrayBuffer();
+        const base64Data = btoa(
+          new Uint8Array(arrayBuffer).reduce(
+            (data, byte) => data + String.fromCharCode(byte),
+            ''
+          )
+        );
+
+        console.log("📤 Sending to Edge Function...");
+
+        const uploadRes = await fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/upload-to-cesium-s3`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${session.access_token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              glbData: base64Data,
+              uploadLocation: asset.uploadLocation,
+              fileName: glbFileName,
+            }),
+          }
+        );
+
+        if (!uploadRes.ok) {
+          const errorData = await uploadRes.json();
+          console.error("❌ Edge function error:", errorData);
+          throw new Error(errorData.error || 'Edge function upload failed');
+        }
+
+        const result = await uploadRes.json();
+        
+        if (!result.success) {
+          throw new Error(result.error || 'Upload failed');
+        }
+        
+        console.log("✅ GLB uploaded to Cesium S3 successfully!");
+        toast.success("✅ GLB successfully uploaded to Cesium!");
+
+      } catch (uploadErr) {
+        console.error("❌ Cesium S3 upload failed:", uploadErr);
+        toast.error(`Upload to Cesium failed: ${uploadErr instanceof Error ? uploadErr.message : 'Unknown error'}`);
+        throw uploadErr;
+      }
+
+      // ✅ 7️⃣ Finalize Cesium upload
+      toast.info("Finalizing Cesium upload...");
+      await fetch(asset.onComplete.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(asset.onComplete.fields),
+      });
+
+      // ✅ Extract Cesium asset ID safely
+      const cesiumAssetId = asset?.assetMetadata?.id ?? asset?.id ?? "Unknown";
+      console.log("✅ Cesium Asset finalized with ID:", cesiumAssetId);
+
+      // ✅ 8️⃣ Save site info in Supabase (only `sites` table now)
+      const latitude = coordinates.lat ? parseFloat(coordinates.lat) : null;
+      const longitude = coordinates.lng ? parseFloat(coordinates.lng) : null;
+
+      const { error: dbError } = await supabase.from('sites').insert({
+        name: siteName,
+        location: location || null,
+        latitude,
+        longitude,
+        ifc_file_path: uploadData.path,
+        oss_urn: apsData.urn,
+        status: 'processing',
+        user_id: user.id,
+        ifc_site_id: String(cesiumAssetId),
+      });
+
+      if (dbError) {
+        console.error('Database error:', dbError);
+        toast.error('Failed to save site information');
+        return;
+      }
+
+      setUploadSuccess(true);
+      toast.success('Site created! Model is being processed by Autodesk and Cesium.');
+
+      // ✅ Reset form
+      setSiteName('');
+      setLocation('');
+      setCoordinates({ lat: '', lng: '' });
+      if (fileInputRef.current) fileInputRef.current.value = '';
+
+      onUploadComplete?.();
+
+    } catch (error) {
+      console.error('Upload error:', error);
+      toast.error('An error occurred during upload');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  return (
+    <Card className="p-6 bg-gradient-panel border-dashboard-border">
+      <div className="space-y-6">
+        <div className="text-center">
+          <div className="flex justify-center mb-4">
+            <div className="p-3 bg-primary/10 rounded-full">
+              <Upload className="w-6 h-6 text-primary" />
+            </div>
+          </div>
+          <h3 className="text-lg font-semibold text-foreground mb-2">
+            Upload IFC File
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            Upload your telecom tower site IFC model file
+          </p>
+        </div>
+
+        {uploadSuccess && (
+          <Alert className="border-success/20 bg-success/5">
+            <CheckCircle className="h-4 w-4 text-success" />
+            <AlertDescription className="text-success">
+              IFC file uploaded successfully! The site has been added to your dashboard.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <div className="space-y-4">
+          <div>
+            <Label htmlFor="siteName">Site Name *</Label>
+            <Input
+              id="siteName"
+              value={siteName}
+              onChange={(e) => setSiteName(e.target.value)}
+              placeholder="e.g., Qatar Tower A"
+              className="mt-1"
+            />
+          </div>
+
+          <div>
+            <Label htmlFor="location">Location</Label>
+            <Input
+              id="location"
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              placeholder="e.g., Doha, Qatar"
+              className="mt-1"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="latitude">Latitude</Label>
+              <Input
+                id="latitude"
+                value={coordinates.lat}
+                onChange={(e) =>
+                  setCoordinates((prev) => ({ ...prev, lat: e.target.value }))
+                }
+                placeholder="e.g., 25.2854"
+                className="mt-1"
+              />
+            </div>
+            <div>
+              <Label htmlFor="longitude">Longitude</Label>
+              <Input
+                id="longitude"
+                value={coordinates.lng}
+                onChange={(e) =>
+                  setCoordinates((prev) => ({ ...prev, lng: e.target.value }))
+                }
+                placeholder="e.g., 51.5310"
+                className="mt-1"
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor="ifcFile">IFC File *</Label>
+            <div className="mt-1">
+              <Input
+                ref={fileInputRef}
+                id="ifcFile"
+                type="file"
+                accept=".ifc"
+                onChange={handleFileUpload}
+                disabled={isUploading}
+                className="file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90"
+              />
+            </div>
+          </div>
+        </div>
+
+        {isUploading && (
+          <Alert>
+            <FileText className="h-4 w-4" />
+            <AlertDescription>
+              Uploading IFC file and processing with Autodesk & Cesium...
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <AlertCircle className="w-4 h-4" />
+          <span>Only .ifc files are supported. Maximum file size: 50MB</span>
+        </div>
+      </div>
+    </Card>
+  );
+};
+VITE_SUPABASE_PROJECT_ID="ipkbvsylwieuljpfbyxy"
+VITE_SUPABASE_PUBLISHABLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlwa2J2c3lsd2lldWxqcGZieXh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzNjE5NjMsImV4cCI6MjA3NjkzNzk2M30.km-_Yco48Pglm5r5-aYkyhqFpnnxzOfykebrVrX01ew"
+VITE_SUPABASE_URL="https://ipkbvsylwieuljpfbyxy.supabase.co"
+VITE_CESIUM_ION_TOKEN= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI4MDQ5M2FkMy0zZWY1LTRhMWItODNlYi1lYTA3OTE1NWE4ZDciLCJpZCI6MzUwNjY5LCJpYXQiOjE3NjA1MTM4MTJ9.uWoHR83JvEwAj3VtZ_NHwgfP6sH8p89y_T2WZngHc1g"
